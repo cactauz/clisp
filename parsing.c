@@ -39,6 +39,7 @@ enum
     LVAL_LONG,
     LVAL_SYM,
     LVAL_SEXPR,
+    LVAL_QEXPR,
     LVAL_ERR
 };
 
@@ -92,6 +93,15 @@ lval *lval_sexpr(void)
     return v;
 }
 
+lval *lval_qexpr(void)
+{
+    lval *v = malloc(sizeof(lval));
+    v->type = LVAL_QEXPR;
+    v->count = 0;
+    v->cell = NULL;
+    return v;
+}
+
 void lval_del(lval *v)
 {
     switch (v->type)
@@ -106,6 +116,7 @@ void lval_del(lval *v)
     case LVAL_SYM:
         free(v->sym);
         break;
+    case LVAL_QEXPR:
     case LVAL_SEXPR:
         for (int i = 0; i < v->count; i++)
         {
@@ -164,6 +175,10 @@ lval *lval_read(mpc_ast_t *t)
     {
         x = lval_sexpr();
     }
+    if (strstr(t->tag, "qexpr"))
+    {
+        x = lval_qexpr();
+    }
 
     for (int i = 0; i < t->children_num; i++)
     {
@@ -172,6 +187,14 @@ lval *lval_read(mpc_ast_t *t)
             continue;
         }
         if (strcmp(t->children[i]->contents, ")") == 0)
+        {
+            continue;
+        }
+        if (strcmp(t->children[i]->contents, "}") == 0)
+        {
+            continue;
+        }
+        if (strcmp(t->children[i]->contents, "{") == 0)
         {
             continue;
         }
@@ -220,6 +243,9 @@ void lval_print(lval *v)
         break;
     case LVAL_SEXPR:
         lval_expr_print(v, '(', ')');
+        break;
+    case LVAL_QEXPR:
+        lval_expr_print(v, '{', '}');
         break;
     }
 }
@@ -326,6 +352,159 @@ lval *lval_take(lval *v, int i)
     return x;
 }
 
+#define LASSERT(args, cond, err) \
+    if (!(cond))                 \
+    {                            \
+        lval_del(args);          \
+        return lval_err(err);    \
+    }
+
+lval *builtin_head(lval *a)
+{
+    LASSERT(a, a->count == 1,
+            "head passed more than one qexpr");
+
+    LASSERT(a, a->cell[0]->type == LVAL_QEXPR,
+            "head passed non-qexpr");
+
+    LASSERT(a, a->cell[0]->count != 0,
+            "head on empty qexpr");
+
+    // take qexpr
+    lval *v = lval_take(a, 0);
+
+    // delete everything but the head
+    while (v->count > 1)
+    {
+        lval_del(lval_pop(v, 1));
+    }
+    return v;
+}
+
+lval *builtin_tail(lval *a)
+{
+    LASSERT(a, a->count == 1,
+            "tail passed more than one qexpr");
+
+    LASSERT(a, a->cell[0]->type == LVAL_QEXPR,
+            "tail passed non-qexpr");
+
+    LASSERT(a, a->cell[0]->count != 0,
+            "tail on empty qexpr");
+
+    // take qexpr
+    lval *v = lval_take(a, 0);
+
+    // delete head
+    lval_del(lval_pop(v, 0));
+    return v;
+}
+
+lval *builtin_list(lval *a)
+{
+    a->type = LVAL_QEXPR;
+    return a;
+}
+
+lval *lval_eval(lval *v);
+
+lval *builtin_eval(lval *a)
+{
+    LASSERT(a, a->count == 1,
+            "eval passed more than one qexpr");
+
+    LASSERT(a, a->cell[0]->type == LVAL_QEXPR,
+            "eval passed non-qexpr");
+
+    lval *x = lval_take(a, 0);
+    x->type = LVAL_SEXPR;
+    return lval_eval(x);
+}
+
+lval *lval_join(lval *x, lval *y)
+{
+    while (y->count)
+    {
+        x = lval_add(x, lval_pop(y, 0));
+    }
+
+    lval_del(y);
+    return x;
+}
+
+lval *builtin_join(lval *a)
+{
+    for (int i = 0; i < a->count; i++)
+    {
+        LASSERT(a, a->cell[i]->type == LVAL_QEXPR,
+                "join passed non-qexpr");
+    }
+
+    lval *x = lval_pop(a, 0);
+    while (a->count)
+    {
+        x = lval_join(x, lval_pop(a, 0));
+    }
+
+    lval_del(a);
+    return x;
+}
+
+lval *builtin_len(lval *a)
+{
+    LASSERT(a, a->count == 1,
+            "len passed more than one qexpr");
+
+    LASSERT(a, a->cell[0]->type == LVAL_QEXPR,
+            "len passed non-qexpr");
+
+    lval *v = lval_pop(a, 0);
+    lval *len = lval_long(v->count);
+
+    lval_del(v);
+
+    return len;
+}
+
+lval *builtin_cons(lval *a)
+{
+    LASSERT(a, a->cell[1]->type == LVAL_QEXPR,
+            "cons passed non-qexpr on right");
+
+    LASSERT(a, a->count == 2,
+            "cons passed too many args");
+
+    lval *x = lval_pop(a, 0);
+    lval *xs = lval_pop(a, 0);
+    lval *cons = lval_qexpr();
+
+    cons = lval_add(cons, lval_eval(x));
+    cons = lval_join(cons, xs);
+    lval_del(x);
+    lval_del(xs);
+
+    return cons;
+}
+
+lval *builtin_init(lval *a)
+{
+    LASSERT(a, a->count == 1,
+            "init passed more than one qexpr");
+
+    LASSERT(a, a->cell[0]->type == LVAL_QEXPR,
+            "init passed non-qexpr");
+
+    LASSERT(a, a->cell[0]->count != 0,
+            "init on empty qexpr");
+
+    lval *v = lval_pop(a, 0);
+
+    // delete last item
+    lval_del(lval_pop(v, v->count - 1));
+
+    return v;
+}
+
 lval *builtin_op(lval *a, char *op)
 {
     // ensure args are nums
@@ -376,7 +555,47 @@ lval *builtin_op(lval *a, char *op)
     return x;
 }
 
-lval *lval_eval(lval *v);
+lval *builtin(lval *a, char *func)
+{
+    if (strcmp("list", func) == 0)
+    {
+        return builtin_list(a);
+    }
+    if (strcmp("head", func) == 0)
+    {
+        return builtin_head(a);
+    }
+    if (strcmp("tail", func) == 0)
+    {
+        return builtin_tail(a);
+    }
+    if (strcmp("join", func) == 0)
+    {
+        return builtin_join(a);
+    }
+    if (strcmp("eval", func) == 0)
+    {
+        return builtin_eval(a);
+    }
+    if (strcmp("cons", func) == 0)
+    {
+        return builtin_cons(a);
+    }
+    if (strcmp("init", func) == 0)
+    {
+        return builtin_init(a);
+    }
+    if (strcmp("len", func) == 0)
+    {
+        return builtin_len(a);
+    }
+    if (strstr("+-*/%^minmax", func))
+    {
+        return builtin_op(a, func);
+    }
+    lval_del(a);
+    return lval_err("unknown function");
+}
 
 lval *lval_eval_sexpr(lval *v)
 {
@@ -414,7 +633,7 @@ lval *lval_eval_sexpr(lval *v)
         return lval_err("sexpression does not start with symbol");
     }
 
-    lval *result = builtin_op(v, f->sym);
+    lval *result = builtin(v, f->sym);
     lval_del(f);
     return result;
 }
@@ -434,20 +653,24 @@ int main(int argc, char **argv)
     mpc_parser_t *Long = mpc_new("long");
     mpc_parser_t *Symbol = mpc_new("symbol");
     mpc_parser_t *Sexpr = mpc_new("sexpr");
+    mpc_parser_t *Qexpr = mpc_new("qexpr");
     mpc_parser_t *Expr = mpc_new("expr");
     mpc_parser_t *Clisp = mpc_new("clisp");
 
-    mpca_lang(MPCA_LANG_DEFAULT, "                                     \
-        double   : /-?[0-9]+\\.[0-9]+/ ; \
-        long     : /-?[0-9]+/ ;                                        \
-        symbol   : '+' | '-' | '*' | '/' | '%' | '^' | /min/ | /max/ ; \
-        sexpr    : '(' <expr>* ')' ; \
-        expr     : <double> | <long> | <symbol> | <sexpr> ;             \
-        clisp    : /^/ <expr>+ /$/ ;                        \
+    mpca_lang(MPCA_LANG_DEFAULT, "                                       \
+        double  : /-?[0-9]+\\.[0-9]+/ ;                                  \
+        long    : /-?[0-9]+/ ;                                           \
+        symbol  : '+' | '-' | '*' | '/' | '%' | '^' | \"min\"| \"max\"   \
+                | \"list\" | \"head\" | \"tail\" | \"join\" | \"eval\"   \
+                | \"cons\" | \"init\" | \"len\" ;                        \
+        sexpr   : '(' <expr>* ')' ;                                      \
+        qexpr   : '{' <expr>* '}' ;                                      \
+        expr    : <double> | <long> | <symbol> | <sexpr> | <qexpr> ;     \
+        clisp   : /^/ <expr>+ /$/ ;                                      \
     ",
-              Double, Long, Symbol, Sexpr, Expr, Clisp);
+              Double, Long, Symbol, Sexpr, Qexpr, Expr, Clisp);
 
-    puts("clisp v 0.1");
+    puts("clisp v 0.2");
     puts("press ctrl+c to exit\n");
 
     while (1)
@@ -457,9 +680,12 @@ int main(int argc, char **argv)
         mpc_result_t r;
         if (mpc_parse("<stdin>", input, Clisp, &r))
         {
-            lval *x = lval_eval(lval_read(r.output));
+            lval *parsed = lval_read(r.output);
+            lval_println(parsed);
+            lval *x = lval_eval(parsed);
             lval_println(x);
             lval_del(x);
+            lval_del(parsed);
             mpc_ast_delete(r.output);
         }
         else
@@ -469,6 +695,6 @@ int main(int argc, char **argv)
         }
     }
 
-    mpc_cleanup(6, Double, Long, Symbol, Sexpr, Expr, Clisp);
+    mpc_cleanup(7, Double, Long, Symbol, Sexpr, Qexpr, Expr, Clisp);
     return 0;
 }
